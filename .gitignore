@@ -7,3 +7,6 @@ __pycache__/
 
 # DreamSim weights (default cache folder)
 /models/
+
+# scripts/test_resume.sh output
+/test_resume/

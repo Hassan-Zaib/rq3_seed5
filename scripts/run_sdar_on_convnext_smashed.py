@@ -3,6 +3,9 @@ import argparse
 import copy
 import json
 import math
+import os
+import random
+import signal
 import sys
 import time
 from contextlib import nullcontext
@@ -58,6 +61,118 @@ class ModelEmaPair:
                 ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
             else:
                 ema_value.copy_(model_value)
+
+
+CKPT_KEEP = 2
+# Arguments that may differ between the run that wrote a checkpoint and the run that resumes it.
+CKPT_FREE_ARGS = {"ckpt_every", "ckpt_dir"}
+
+
+def rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def set_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+class ResumableLoader:
+    """Draws batches exactly like next_batch() and records what is needed to rebuild the position after a
+    restart: the epoch, the number of batches drawn in it, and the global torch RNG state when its iterator was
+    created and when its first batch was drawn (the shuffle order and the worker seeds come from that RNG)."""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self.epoch = 0
+        self._new_iterator()
+
+    def _new_iterator(self):
+        self.rng_at_iter = torch.get_rng_state()
+        self.iterator = iter(self.loader)
+        self.rng_at_first_batch = None
+        self.batch_index = 0
+
+    def _draw(self):
+        if self.batch_index == 0:
+            self.rng_at_first_batch = torch.get_rng_state()
+        batch = next(self.iterator)
+        self.batch_index += 1
+        return batch
+
+    def next(self):
+        try:
+            return self._draw()
+        except StopIteration:
+            self.epoch += 1
+            self._new_iterator()
+            return self._draw()
+
+    def state_dict(self):
+        return {
+            "epoch": self.epoch,
+            "batch_index": self.batch_index,
+            "rng_at_iter": self.rng_at_iter,
+            "rng_at_first_batch": self.rng_at_first_batch,
+        }
+
+    def load_state_dict(self, state):
+        """Recreates the iterator and skips the batches already drawn. Changes the global torch RNG; the caller
+        restores it afterwards."""
+        self.epoch = state["epoch"]
+        self.rng_at_iter = state["rng_at_iter"]
+        torch.set_rng_state(self.rng_at_iter)
+        self.iterator = iter(self.loader)
+        self.rng_at_first_batch = state["rng_at_first_batch"]
+        self.batch_index = 0
+        if state["batch_index"] == 0:
+            return
+        torch.set_rng_state(self.rng_at_first_batch)
+        # Without workers only the sampler is advanced (no images are loaded); with workers the batches are drawn.
+        indices_only = self.loader.num_workers == 0 and hasattr(self.iterator, "_next_index")
+        for _ in range(state["batch_index"]):
+            if indices_only:
+                self.iterator._next_index()
+            else:
+                next(self.iterator)
+        self.batch_index = state["batch_index"]
+
+
+def list_checkpoints(ckpt_dir):
+    return sorted(Path(ckpt_dir).glob("ckpt_step*.pt"))
+
+
+def save_checkpoint(ckpt_dir, step, payload):
+    """Writes ckpt_step<step>.pt atomically (temp file, then os.replace) and keeps the last CKPT_KEEP."""
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    path = ckpt_dir / f"ckpt_step{step:07d}.pt"
+    tmp = ckpt_dir / f".{path.name}.tmp"
+    with open(tmp, "wb") as f:
+        torch.save(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    for old in list_checkpoints(ckpt_dir)[:-CKPT_KEEP]:
+        old.unlink()
+    return path
+
+
+def load_latest_checkpoint(ckpt_dir):
+    for path in reversed(list_checkpoints(ckpt_dir)):
+        try:
+            return path, torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            print(f"Cannot read checkpoint {path} ({exc}); trying the previous one", flush=True)
+    return None, None
 
 
 def autocast_context(device, enabled, amp_dtype):
@@ -442,12 +557,24 @@ def main():
         default=0.0,
         help="0 matches official SDAR; set a positive value only as a documented stability adaptation.",
     )
+    parser.add_argument(
+        "--ckpt-every",
+        type=int,
+        default=2000,
+        help="save a resumable checkpoint every N steps (0: only on SIGTERM/SIGUSR1)",
+    )
+    parser.add_argument(
+        "--ckpt-dir",
+        default=None,
+        help="checkpoint folder; default <run-root>/<defense>/<cut>/sdar/checkpoints",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = get_device()
     out_dir = Path(args.run_root) / args.defense / args.cut / "sdar"
     out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else out_dir / "checkpoints"
 
     victim_client, victim_server, checkpoint_path = build_victim(
         args.run_root,
@@ -488,8 +615,8 @@ def main():
         args.attack_pool,
         args.victim_train_transform,
     )
-    victim_iterator = iter(victim_loader)
-    auxiliary_iterator = iter(auxiliary_loader)
+    victim_stream = ResumableLoader(victim_loader)
+    auxiliary_stream = ResumableLoader(auxiliary_loader)
     history = {
         key: []
         for key in (
@@ -518,9 +645,70 @@ def main():
     }
     started = time.time()
 
-    for step in range(1, args.steps + 1):
-        victim_batch, victim_iterator = next_batch(victim_iterator, victim_loader)
-        auxiliary_batch, auxiliary_iterator = next_batch(auxiliary_iterator, auxiliary_loader)
+    ckpt_models = {
+        "victim_client": victim_client,
+        "victim_server": victim_server,
+        "simulator": simulator,
+        "feature_discriminator": feature_discriminator,
+        "decoder": decoder,
+        "image_discriminator": image_discriminator,
+    }
+    if ema is not None:
+        ckpt_models["ema_victim_client"] = ema.client
+        ckpt_models["ema_victim_server"] = ema.server
+    ckpt_optimizers = {
+        "fg": fg_optimizer,
+        "e": e_optimizer,
+        "e_dis": e_dis_optimizer,
+        "d": d_optimizer,
+        "d_dis": d_dis_optimizer,
+    }
+    ckpt_args = {key: value for key, value in vars(args).items() if key not in CKPT_FREE_ARGS}
+
+    def checkpoint_payload(step):
+        # No LR scheduler objects (set_fg_lr derives the LR from the step) and no GradScaler (bf16 autocast).
+        return {
+            "step": step,
+            "args": ckpt_args,
+            "models": {name: model.state_dict() for name, model in ckpt_models.items()},
+            "optimizers": {name: opt.state_dict() for name, opt in ckpt_optimizers.items()},
+            "loaders": {"victim": victim_stream.state_dict(), "auxiliary": auxiliary_stream.state_dict()},
+            "rng": rng_state(),
+            "history": history,
+            "elapsed_sec": time.time() - started,
+        }
+
+    start_step = 1
+    ckpt_path, ckpt = load_latest_checkpoint(ckpt_dir)
+    if ckpt is not None:
+        changed = sorted(
+            key for key in set(ckpt["args"]) | set(ckpt_args) if ckpt["args"].get(key) != ckpt_args.get(key)
+        )
+        if changed:
+            raise RuntimeError(f"Checkpoint {ckpt_path} was written with different arguments: {changed}")
+        for name, model in ckpt_models.items():
+            model.load_state_dict(ckpt["models"][name])
+        for name, opt in ckpt_optimizers.items():
+            opt.load_state_dict(ckpt["optimizers"][name])
+        victim_stream.load_state_dict(ckpt["loaders"]["victim"])
+        auxiliary_stream.load_state_dict(ckpt["loaders"]["auxiliary"])
+        history = ckpt["history"]
+        started = time.time() - ckpt["elapsed_sec"]
+        set_rng_state(ckpt["rng"])
+        start_step = ckpt["step"] + 1
+        print(f"Resumed from {ckpt_path}: continuing at step {start_step}/{args.steps}", flush=True)
+        del ckpt
+
+    # On SIGTERM/SIGUSR1 (e.g. a cluster time limit) finish the current step, save a checkpoint and exit.
+    stop_signal = []
+    ckpt_signals = [signal.SIGTERM] + ([signal.SIGUSR1] if hasattr(signal, "SIGUSR1") else [])
+    previous_handlers = {
+        signum: signal.signal(signum, lambda signum, frame: stop_signal.append(signum)) for signum in ckpt_signals
+    }
+
+    for step in range(start_step, args.steps + 1):
+        victim_batch = victim_stream.next()
+        auxiliary_batch = auxiliary_stream.next()
         x, y, raw_x = victim_batch[0], victim_batch[1], victim_batch[2]
         xs, ys, raw_xs = auxiliary_batch[0], auxiliary_batch[1], auxiliary_batch[2]
         x = x.to(device, non_blocking=True)
@@ -688,6 +876,15 @@ def main():
                 f"fg_lr={fg_lr:.6g}",
                 flush=True,
             )
+
+        if stop_signal or (args.ckpt_every > 0 and step % args.ckpt_every == 0):
+            path = save_checkpoint(ckpt_dir, step, checkpoint_payload(step))
+            if stop_signal:
+                print(f"Signal {stop_signal[0]}: saved {path} at step {step}; rerun the same command to resume", flush=True)
+                sys.exit(128 + stop_signal[0])
+
+    for signum, handler in previous_handlers.items():
+        signal.signal(signum, handler)
 
     validation_loader = build_eval_loader(
         args.data_root, split="val", batch_size=args.batch_size, num_workers=args.num_workers

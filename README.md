@@ -62,19 +62,25 @@ Each job must finish within 7 hours and needs about 27 GB of GPU memory. Run sev
 
     CUDA_VISIBLE_DEVICES=1 bash scripts/run_one.sh q4 c2
 
-Each job writes to `results_seed5/<defense>/<cut>/sdar/` and logs to `logs_seed5/<defense>_<cut>.log`. A job is done when `results_seed5/<defense>/<cut>/sdar/full_sdar_summary.json` exists. Starting a finished job again does nothing. A job that stopped early starts again from the beginning when you rerun its line.
+Each job writes to `results_seed5/<defense>/<cut>/sdar/` and logs to `logs_seed5/<defense>_<cut>.log`. A job is done when `results_seed5/<defense>/<cut>/sdar/full_sdar_summary.json` exists. Starting a finished job again does nothing.
+
+Each job saves a checkpoint every 2000 steps in `results_seed5/<defense>/<cut>/sdar/checkpoints/` and keeps the last two. When a job receives SIGTERM or SIGUSR1 (for example from the scheduler at a time limit), it finishes the step it is on, saves a checkpoint and stops. To resume a job that stopped, start the same command again. It continues from its last checkpoint with the same data order as an uninterrupted run, and the evaluation runs once at the end as usual.
+
+`bash scripts/test_resume.sh` checks this on your GPU in a few short runs: it compares the original script, an uninterrupted run and a run stopped with SIGTERM and resumed, and prints PASS or FAIL. Its output goes to `test_resume/`, and it deletes its checkpoints at the end. Pass `--data-root DIR` if your Tiny ImageNet is not linked as `data/tiny-imagenet-200`. If your GPU runs out of memory, add `--batch-size 64`; that option is only for this test.
 
 The script runs seed 5 only and refuses any other seed.
 
 ## 6. If something goes wrong
 
-The job stops before training if the data link, the fixed evaluation images, the GPU or LPIPS is not right, and the log says which. If a job fails or hits the time limit, please send me its log and I'll look at it. Please don't change any setting to make it fit.
+The job stops before training if the data link, the fixed evaluation images, the GPU or LPIPS is not right, and the log says which. If a job hits the time limit, start it again to resume it (section 5). If a job fails, please send me its log and I'll look at it. Please don't change any setting to make it fit.
 
 ## 7. Sending the results back
 
 When all 20 jobs are done, run this from the repository folder and send me the zip:
 
-    zip -r rq3_seed5_results.zip results_seed5 logs_seed5
+    zip -r rq3_seed5_results.zip results_seed5 logs_seed5 -x '*/checkpoints/*'
+
+The checkpoints are large and only needed for resuming, so they stay out of the zip. You can delete them once all jobs are done.
 
 ## Please don't change
 

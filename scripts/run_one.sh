@@ -74,7 +74,8 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 mkdir -p logs_seed5
-exec > >(tee -a "logs_seed5/${DEFENSE}_${CUT}.log") 2>&1
+# tee ignores SIGTERM/SIGUSR1 so it keeps logging while python saves its checkpoint on a cluster time limit.
+exec > >(trap '' TERM USR1; exec tee -a "logs_seed5/${DEFENSE}_${CUT}.log") 2>&1
 echo "===== RQ3 seed ${RUN_SEED} online SDAR ConvNeXt-Tiny TinyImageNet ${DEFENSE} ${CUT} ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ====="
 
 # ---- checks before training (fail here, not hours later) --------------------------------------------------
