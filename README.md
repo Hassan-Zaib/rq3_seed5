@@ -86,10 +86,13 @@ Thanks again!
 
 ## DreamSim on finished jobs
 
-`dreamsim_eval.py` computes DreamSim (lower = more similar) between the 20 fixed
-probe images and their reconstructions (`fixed_probe_originals.npy` against
-`fixed_probe_reconstructions.npy`) of every finished job, on your machine, so no
-images need to be sent. A job counts as finished when it has `full_sdar_summary.json`.
+`dreamsim_eval.py` computes DreamSim (lower = more similar) between originals and
+reconstructions of every finished job, on your machine, so no images need to be
+sent. The main pair is `originals.npy` against `reconstructions.npy` (the 1280
+validation images that the SSIM, PSNR and LPIPS in `full_sdar_summary.json` use);
+the 20 fixed probe images (`fixed_probe_originals.npy` against
+`fixed_probe_reconstructions.npy`) are added as a second pair. A job counts as
+finished when it has `full_sdar_summary.json`.
 
 Install it in its own environment:
 
@@ -108,6 +111,6 @@ It writes `dreamsim.json` next to each `full_sdar_summary.json` and one
 `dreamsim_all.csv` here. Jobs that already have a `dreamsim.json` are skipped, so
 you can run it again as more jobs finish; `--force` recomputes them.
 
-What to send back (a few KB):
+What to send back (under 1 MB):
 
     zip rq3_dreamsim.zip dreamsim_all.csv results_seed5/*/*/sdar/dreamsim.json

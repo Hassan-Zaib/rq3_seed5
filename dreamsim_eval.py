@@ -34,6 +34,8 @@ import numpy as np
 #   orig, recon - candidate .npy files (globs, relative to the run folder); the first
 #                 pattern that matches is used and must match exactly one file
 #   orig_dir, recon_dir - instead of orig/recon: folders of .png files, paired by file name
+#   check_n     - optional (json file, key): the run's own summary records how many images its
+#                 metrics used; the pair must have exactly that many
 #   shared_orig - if the run has no originals file, use --orig-file, or with
 #                 dataset_eval the shared eval file of the dataset in the run name
 #                 (DATASET_EVAL; the one whose image size matches the reconstructions)
@@ -47,8 +49,9 @@ import numpy as np
 #   RQ1 UnSplit  : reconstructions/<name>/summary.json, originals/*.png, reconstructions/*.png
 #   RQ1 MAERA    : maera/<name>/summary.json, eval128_recon.npy (originals: eval/<dataset>_orig.npy)
 #   RQ1 SimLIA   : no images (its run folders are listed and skipped)
-#   RQ3 SDAR     : <defense>/<cut>/sdar/full_sdar_summary.json, fixed_probe_{originals,reconstructions}.npy
-#                  (20 fixed probe images), originals.npy, reconstructions.npy (not used)
+#   RQ3 SDAR     : <defense>/<cut>/sdar/full_sdar_summary.json, originals.npy, reconstructions.npy
+#                  (first --eval-samples=1280 val images; the set its SSIM/PSNR/LPIPS use),
+#                  fixed_probe_{originals,reconstructions}.npy (20 fixed probe images; its fixed_probe_* metrics)
 # ---------------------------------------------------------------------------
 PAIR_SPECS = [
     # RQ2 SDAR round-robin and parallel SL
@@ -69,9 +72,12 @@ PAIR_SPECS = [
     # RQ1 MAERA
     {"name": "eval128", "marker": "summary.json",
      "orig": [], "recon": ["eval128_recon.npy"], "shared_orig": True, "dataset_eval": True},
-    # RQ3 SDAR on ConvNeXt
+    # RQ3 SDAR on ConvNeXt: main pair = the images of the summary's SSIM/PSNR/LPIPS; fixed probe as an extra
+    {"name": "eval", "marker": "full_sdar_summary.json",
+     "orig": ["originals.npy"], "recon": ["reconstructions.npy"], "check_n": ("full_sdar_summary.json", "n")},
     {"name": "fixed_probe", "marker": "full_sdar_summary.json",
-     "orig": ["fixed_probe_originals.npy"], "recon": ["fixed_probe_reconstructions.npy"]},
+     "orig": ["fixed_probe_originals.npy"], "recon": ["fixed_probe_reconstructions.npy"],
+     "check_n": ("full_sdar_summary.json", "fixed_probe_n")},
 ]
 
 # Shared eval files (relative to this script's folder), by the dataset named in the run folder.
@@ -189,7 +195,7 @@ def find_pairs(run_dir, markers, orig_file, root):
             if orig is None:
                 print(f"  WARNING: {run_dir.name}: {recon.name} has no originals (use --orig-file?)", file=sys.stderr)
                 continue
-            pairs.append({"name": name, "kind": "npy", "orig": orig, "recon": recon})
+            pairs.append({"name": name, "kind": "npy", "orig": orig, "recon": recon, "check_n": spec.get("check_n")})
         except Exception as e:
             errors.append(f"{name}: {e}")
     names = [p["name"] for p in pairs]
@@ -271,6 +277,12 @@ def load_pair(pair):
         recon, ri = to_uint8_nhwc(np.load(pair["recon"]), pair["recon"])
     if orig.shape != recon.shape:
         raise ValueError(f"shape mismatch: {pair['orig'].name} {orig.shape} vs {pair['recon'].name} {recon.shape}")
+    if pair.get("check_n"):
+        fname, key = pair["check_n"]
+        summary_path = pair["recon"].parent / fname
+        n_summary = json.loads(summary_path.read_text()).get(key) if summary_path.is_file() else None
+        if n_summary is not None and int(n_summary) != len(recon):
+            raise ValueError(f"{fname} says {key}={n_summary}, but {pair['recon'].name} has {len(recon)} images")
     return orig, recon, oi, ri
 
 
