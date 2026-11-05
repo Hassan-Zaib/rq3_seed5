@@ -83,3 +83,31 @@ The scripts, their settings (steps, batch size, learning rates and so on) and th
 `dgx/run_seeds45_one_defense.sh` is the launcher I used on the DGX. It's only there as the reference for `check_seed5.sh`, so please don't run it.
 
 Thanks again!
+
+## DreamSim on finished jobs
+
+`dreamsim_eval.py` computes DreamSim (lower = more similar) between the 20 fixed
+probe images and their reconstructions (`fixed_probe_originals.npy` against
+`fixed_probe_reconstructions.npy`) of every finished job, on your machine, so no
+images need to be sent. A job counts as finished when it has `full_sdar_summary.json`.
+
+Install it in its own environment:
+
+    conda create -n dreamsim python=3.10 -y
+    conda activate dreamsim
+    pip install dreamsim
+
+The first real run downloads the DreamSim weights into `--cache-dir`. If your
+GPU nodes have no internet, run it once on a login node first with the same
+`--cache-dir`. From the repository folder, first check what it finds, then run it:
+
+    python dreamsim_eval.py results_seed5 --dry-run
+    python dreamsim_eval.py results_seed5 --cache-dir ~/dreamsim_models
+
+It writes `dreamsim.json` next to each `full_sdar_summary.json` and one
+`dreamsim_all.csv` here. Jobs that already have a `dreamsim.json` are skipped, so
+you can run it again as more jobs finish; `--force` recomputes them.
+
+What to send back (a few KB):
+
+    zip rq3_dreamsim.zip dreamsim_all.csv results_seed5/*/*/sdar/dreamsim.json
