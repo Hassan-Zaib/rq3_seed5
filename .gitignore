@@ -1,0 +1,6 @@
+data/
+results_seed5/
+logs_seed5/
+__pycache__/
+*.pyc
+.DS_Store

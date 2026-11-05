@@ -1,0 +1,24 @@
+# Environment for the RQ3 code (conda env create -f env_rq3.yml, then conda activate rq3).
+# Packages are the third-party imports of scripts/ and src/: torch, torchvision, numpy, Pillow, scikit-image (SSIM)
+# and lpips (LPIPS). Nothing else is imported; timm is not used.
+# Versions are those of the DGX rq3 env; torch and torchvision are the CUDA 12.4 builds.
+#
+# Weights: there are no ConvNeXt weights to download. The ConvNeXt-Tiny split model (src/convnext_split.py) is
+# built in the code and trained from scratch in every job. The only pretrained weights are LPIPS's: the lpips
+# package ships its own linear layers, and on first use torchvision downloads the ImageNet AlexNet weights
+# (alexnet-owt-7be5be79.pth) into ~/.cache/torch/hub/checkpoints/. scripts/run_one.sh loads LPIPS before
+# training, so a job without internet access stops right away instead of after training (README section 3).
+name: rq3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - torchvision==0.21.0+cu124
+      - numpy==2.2.6
+      - pillow==12.2.0
+      - scikit-image==0.25.2
+      - lpips==0.1.4
