@@ -701,6 +701,8 @@ def main():
 
     # On SIGTERM/SIGUSR1 (e.g. a cluster time limit) finish the current step, save a checkpoint and exit.
     stop_signal = []
+    # Test only (scripts/test_resume.sh): this process sends itself SIGTERM right after the given step.
+    test_sigterm_step = int(os.environ.get("RQ3_TEST_SIGTERM_AT_STEP", "0"))
     ckpt_signals = [signal.SIGTERM] + ([signal.SIGUSR1] if hasattr(signal, "SIGUSR1") else [])
     previous_handlers = {
         signum: signal.signal(signum, lambda signum, frame: stop_signal.append(signum)) for signum in ckpt_signals
@@ -877,6 +879,8 @@ def main():
                 flush=True,
             )
 
+        if step == test_sigterm_step:
+            os.kill(os.getpid(), signal.SIGTERM)
         if stop_signal or (args.ckpt_every > 0 and step % args.ckpt_every == 0):
             path = save_checkpoint(ckpt_dir, step, checkpoint_payload(step))
             if stop_signal:
