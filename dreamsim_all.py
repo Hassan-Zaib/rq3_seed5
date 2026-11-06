@@ -9,6 +9,10 @@ dreamsim.json are not recomputed; their stored values go into the table.
 
 Known formats (run folder = the folder holding the marker):
   RQ1 SDAR     <name>/output/<name>_metrics.json  ->  output/<name>_orig.npy vs output/<name>_recon.npy
+               If output/ holds several *_recon.npy (seed-1 layout: resnet18_lc<N>_run1_{orig,recon}.npy, all
+               cuts in one folder), each is paired with the *_orig.npy of the same stem, the cut is taken from
+               "lc<N>", the seed is 1, and each pair gets its own dreamsim_lc<N>.json (dreamsim_<stem>.json if
+               the stem has no lc<N>).
   RQ1 MAERA    maera/<name>_ep500/summary.json    ->  eval/<dataset>_orig.npy (the fixed originals; the 32x32
                one for _in32 runs) vs eval128_recon.npy. Only folders whose name ends in _ep500.
   RQ1 PCAT     <name>/metrics.json                ->  orig.npy vs recon.npy
@@ -19,6 +23,9 @@ Known formats (run folder = the folder holding the marker):
 
     python dreamsim_all.py sdarresnet18-10 maeraresnet18-100 pcat_rq1 unsplitresnet18-tiny
     python dreamsim_all.py . --quick          # only the first folder still to do; prints its result
+
+Files whose name starts with "._" (macOS metadata) are always ignored, and nothing under a scripts/ folder is
+searched.
 """
 
 import argparse
@@ -30,13 +37,20 @@ from pathlib import Path
 import numpy as np
 
 from dreamsim_eval import (DATASET_RE, RESULT_FILE, dataset_eval_file, dreamsim_distances, load_dreamsim,
-                           load_png_dirs, rel_path, to_uint8_nhwc, write_json)
+                           rel_path, to_uint8_nhwc, write_json)
 
 ROOT = Path(__file__).resolve().parent
-SKIP_DIRS = {".git", "checkpoints", "__pycache__", "data", "datasets"}
+SKIP_DIRS = {".git", "checkpoints", "__pycache__", "data", "datasets", "scripts"}
 ATTACK_DIR_PREFIX = (("sdarresnet18", "sdar"), ("maeraresnet18", "maera"), ("pcat", "pcat"), ("unsplitresnet18", "unsplit"))
 FOLDER_DATASET = (("-100", "cifar100"), ("-10", "cifar10"), ("-tiny", "tinyimagenet"), ("_tiny", "tinyimagenet"))
 UNSPLIT_N = 20
+LC_RE = re.compile(r"(?:^|_)lc(\d+)(?=_|$)")
+RUN_RE = re.compile(r"(?:^|_)run(\d+)(?=_|$)")
+
+
+def visible(paths):
+    """Drop macOS metadata files (names starting with "._")."""
+    return [p for p in paths if not p.name.startswith("._")]
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +66,13 @@ def walk_markers(root):
         except OSError:
             continue
         for e in entries:
+            if e.name.startswith("._"):
+                continue
             if e.is_dir():
                 if e.name not in SKIP_DIRS and not e.is_symlink():
                     stack.append(e)
             elif e.name in ("full_sdar_summary.json", "metrics.json", "summary.json") or (
-                    e.name.endswith("_metrics.json") and d.name == "output"):
+                    d.name == "output" and (e.name.endswith("_metrics.json") or e.name.endswith("_recon.npy"))):
                 yield d, e.name
 
 
@@ -72,20 +88,45 @@ def attack_from_path(run_dir):
     return None
 
 
+def sdar_units(run_dir):
+    """One unit per output/*_recon.npy. A single file keeps dreamsim.json; several get dreamsim_lc<N>.json each."""
+    recons = sorted(visible((run_dir / "output").glob("*_recon.npy")))
+    if len(recons) <= 1:
+        return [None]
+    units = []
+    for recon in recons:
+        stem = recon.name[: -len("_recon.npy")]
+        lc, run = LC_RE.search(stem), RUN_RE.search(stem)
+        units.append({
+            "stem": stem,
+            "result": f"dreamsim_lc{lc.group(1)}.json" if lc else f"dreamsim_{stem}.json",
+            "cut": f"c{lc.group(1)}" if lc else "",
+            "seed": "1",
+            "run": run.group(1) if run else "",
+        })
+    if len({u["result"] for u in units}) != len(units):  # two stems with the same lc<N>: name by stem
+        for u in units:
+            u["result"] = f"dreamsim_{u['stem']}.json"
+    return units
+
+
 def find_runs(paths):
-    """Return [(run folder, format)] in sorted order; ignored marker folders are not returned."""
+    """Return [(run folder, format, unit)] in sorted order (unit: None, or one SDAR pair of a multi-cut output/)."""
     runs, skipped_maera = {}, []
     for p in paths:
         p = Path(p)
         if not p.is_dir():
             print(f"WARNING: {p} is not a folder", file=sys.stderr)
             continue
+        if "scripts" in p.parts:
+            print(f"WARNING: {p} is under a scripts/ folder, skipped", file=sys.stderr)
+            continue
         for folder, marker in walk_markers(p):
             folder = folder.resolve()
             if marker == "full_sdar_summary.json":
                 runs[folder] = "rq3_sdar"
-            elif marker.endswith("_metrics.json"):
-                runs.setdefault(folder.parent, "sdar")  # <name>/output/<name>_metrics.json
+            elif marker.endswith("_metrics.json") or marker.endswith("_recon.npy"):
+                runs.setdefault(folder.parent, "sdar")  # <name>/output/<name>_{metrics.json,recon.npy}
             elif marker == "metrics.json":
                 if attack_from_path(folder) == "pcat":
                     runs.setdefault(folder, "pcat")
@@ -98,11 +139,15 @@ def find_runs(paths):
                         skipped_maera.append(folder)
                 elif attack == "unsplit" and ((folder / "originals").is_dir() or (folder / "reconstructions").is_dir()):
                     runs.setdefault(folder, "unsplit")
-    return sorted(runs.items()), sorted(set(skipped_maera))
+    units = []
+    for run_dir, fmt in sorted(runs.items()):
+        for unit in (sdar_units(run_dir) if fmt == "sdar" else [None]):
+            units.append((run_dir, fmt, unit))
+    return units, sorted(set(skipped_maera))
 
 
-def describe(run_dir, fmt):
-    """attack, dataset, cut, seed, defense for the table, from the folder names."""
+def describe(run_dir, fmt, unit=None):
+    """attack, dataset, cut, seed, defense for the table, from the folder names (and the SDAR file stem)."""
     parts = run_dir.parts
     meta = {"attack": {"rq3_sdar": "sdar_convnext"}.get(fmt, fmt), "dataset": "", "cut": "", "seed": "", "defense": ""}
     if fmt == "rq3_sdar":  # .../results_seed<k>/<defense>/<cut>/sdar
@@ -133,6 +178,8 @@ def describe(run_dir, fmt):
             m = re.search(r"seed(\d+)", part)
             if m:
                 meta["seed"] = m.group(1)
+    if unit is not None:
+        meta["cut"], meta["seed"] = unit["cut"] or meta["cut"], unit["seed"]
     return meta
 
 
@@ -140,13 +187,13 @@ def describe(run_dir, fmt):
 # pairs per format
 # ---------------------------------------------------------------------------
 def one(run_dir, pattern):
-    matches = sorted(run_dir.glob(pattern))
+    matches = sorted(visible(run_dir.glob(pattern)))
     if len(matches) > 1:
         raise ValueError(f"{pattern} matches {len(matches)} files")
     return matches[0] if matches else None
 
 
-def find_pairs(run_dir, fmt):
+def find_pairs(run_dir, fmt, unit=None):
     """Return ([pair], [missing]) where pair = dict(name, kind, orig, recon, check_n) and missing = messages."""
     pairs, missing = [], []
 
@@ -160,7 +207,9 @@ def find_pairs(run_dir, fmt):
         if recon is not None and orig is not None:
             pairs.append({"name": name, "kind": "npy", "orig": orig, "recon": recon, "check_n": check_n})
 
-    if fmt == "sdar":
+    if fmt == "sdar" and unit is not None:
+        npy_pair("eval128", f"output/{unit['stem']}_orig.npy", f"output/{unit['stem']}_recon.npy")
+    elif fmt == "sdar":
         npy_pair("eval128", "output/*_orig.npy", "output/*_recon.npy")
     elif fmt == "pcat":
         npy_pair("eval128", "orig.npy", "recon.npy")
@@ -177,9 +226,9 @@ def find_pairs(run_dir, fmt):
                 pairs.append({"name": "eval128", "kind": "npy", "orig": orig, "recon": recon, "check_n": None})
     elif fmt == "unsplit":
         od, rd = run_dir / "originals", run_dir / "reconstructions"
-        if not rd.is_dir() or not any(rd.glob("*.png")):
+        if not rd.is_dir() or not visible(rd.glob("*.png")):
             missing.append("attacked: no reconstructions (reconstructions/*.png)")
-        if not od.is_dir() or not any(od.glob("*.png")):
+        if not od.is_dir() or not visible(od.glob("*.png")):
             missing.append("attacked: no originals (originals/*.png)")
         if not missing:
             pairs.append({"name": "attacked", "kind": "png", "orig": od, "recon": rd, "check_n": None})
@@ -188,6 +237,28 @@ def find_pairs(run_dir, fmt):
         npy_pair("fixed_probe", "fixed_probe_originals.npy", "fixed_probe_reconstructions.npy",
                  ("full_sdar_summary.json", "fixed_probe_n"))
     return pairs, missing
+
+
+def load_png_dirs(orig_dir, recon_dir):
+    """As dreamsim_eval.load_png_dirs, but ignoring "._" files."""
+    from PIL import Image
+
+    orig_names = {p.name for p in visible(orig_dir.glob("*.png"))}
+    recon_names = {p.name for p in visible(recon_dir.glob("*.png"))}
+    if not recon_names:
+        raise ValueError(f"no .png files in {recon_dir.name}/")
+    if orig_names != recon_names:
+        raise ValueError(f"{orig_dir.name}/ and {recon_dir.name}/ differ: {len(orig_names - recon_names)} only in "
+                         f"{orig_dir.name}/, {len(recon_names - orig_names)} only in {recon_dir.name}/")
+    names = sorted(recon_names)
+
+    def stack(d):
+        imgs = [np.asarray(Image.open(d / n).convert("RGB"), dtype=np.uint8) for n in names]
+        if len({im.shape for im in imgs}) != 1:
+            raise ValueError(f"{d.name}/: images of different sizes")
+        return np.stack(imgs)
+
+    return stack(orig_dir), stack(recon_dir), names
 
 
 def load_pair(pair, run_dir):
@@ -232,7 +303,7 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
 
     runs, skipped_maera = find_runs(args.roots)
-    print(f"{len(runs)} run folder(s) of a known format"
+    print(f"{len(runs)} run(s) of a known format"
           + (f"; {len(skipped_maera)} older MAERA folder(s) (not _ep500) ignored" if skipped_maera else ""))
     if not runs:
         sys.exit("ERROR: no run folders found")
@@ -240,10 +311,12 @@ def main():
     model = preprocess = versions = None
     rows, missing, errors = [], [], []
     computed = 0
-    for run_dir, fmt in runs:
+    for run_dir, fmt, unit in runs:
         rel = rel_path(run_dir, ROOT)
-        meta = describe(run_dir, fmt)
-        out_path = run_dir / RESULT_FILE
+        if unit is not None:
+            rel = f"{rel} [{unit['stem']}]"
+        meta = describe(run_dir, fmt, unit)
+        out_path = run_dir / (unit["result"] if unit is not None else RESULT_FILE)
         if out_path.is_file():
             if args.quick:
                 continue
@@ -256,7 +329,7 @@ def main():
                 rows.append({**meta, "pair": name, "n": r.get("n"), "mean": r.get("mean"), "folder": rel, "status": "stored"})
             continue
         try:
-            pairs, miss = find_pairs(run_dir, fmt)
+            pairs, miss = find_pairs(run_dir, fmt, unit)
         except ValueError as e:
             errors.append(f"{rel}: {e}")
             continue
@@ -275,7 +348,8 @@ def main():
             model, preprocess, versions = load_dreamsim(device, args.cache_dir)
             print(f"DreamSim {versions['dreamsim_version']}, torch {versions['torch_version']}, device {device}")
         print(f"{rel}  [{meta['attack']} {meta['dataset']} {meta['cut']} seed {meta['seed']}]")
-        result = {**versions, "run_dir": rel, "script": Path(__file__).name, "format": fmt, **meta, "pairs": {}}
+        result = {**versions, "run_dir": rel_path(run_dir, ROOT), "script": Path(__file__).name, "format": fmt, **meta,
+                  **({"stem": unit["stem"], "run": unit["run"]} if unit is not None else {}), "pairs": {}}
         for name, orig, recon, o_label, r_label in loaded:
             d = dreamsim_distances(model, preprocess, orig, recon, versions["device"], args.batch_size)
             result["pairs"][name] = {
@@ -290,7 +364,7 @@ def main():
         write_json(out_path, result)
         computed += 1
         if args.quick:
-            print(f"\nquick: wrote {rel}/{RESULT_FILE}")
+            print(f"\nquick: wrote {rel_path(out_path, ROOT)}")
             print(json.dumps({k: v for k, v in result.items() if k != "pairs"}, indent=2))
             print(json.dumps({n: {k: v for k, v in r.items() if k != "distances"} for n, r in result["pairs"].items()},
                              indent=2))
